@@ -76,7 +76,7 @@ cargo build --release
 docker run -p 3478:3478/udp \
     -e UTURN_EXTERNAL_IP=203.0.113.1 \
     -e UTURN_USERS=alice:secretpass \
-    ghcr.io/srperens/uturn
+    ghcr.io/eyevinn/uturn
 ```
 
 ## Configuration

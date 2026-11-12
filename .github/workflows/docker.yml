@@ -10,7 +10,9 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # Lowercase literal: ghcr rejects uppercase, and github.repository is
+  # "Eyevinn/uturn". Used raw in the push-by-digest and imagetools steps.
+  IMAGE_NAME: eyevinn/uturn
 
 jobs:
   build:
