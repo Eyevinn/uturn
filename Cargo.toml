@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Per Enstedt <per.enstedt@eyevinn.se>"]
 description = "Single-port TURN relay for WebRTC — internal and external routing over one UDP port"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/srperens/uturn"
+repository = "https://github.com/Eyevinn/uturn"
 keywords = ["webrtc", "turn", "stun", "relay", "nat-traversal"]
 categories = ["network-programming", "multimedia"]
 
