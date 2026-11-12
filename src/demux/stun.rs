@@ -271,7 +271,10 @@ impl StunInfo {
     }
 
     /// Decode XOR-PEER-ADDRESS or XOR-MAPPED-ADDRESS
-    fn decode_xor_address(value: &[u8], transaction_id: &[u8; 12]) -> Option<SocketAddr> {
+    pub(crate) fn decode_xor_address(
+        value: &[u8],
+        transaction_id: &[u8; 12],
+    ) -> Option<SocketAddr> {
         if value.len() < 8 {
             return None;
         }

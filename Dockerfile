@@ -22,7 +22,8 @@ COPY --from=builder /build/target/release/uturn /usr/local/bin/uturn
 # needed, grant CAP_NET_BIND_SERVICE at runtime or override USER.
 EXPOSE 3478/udp
 
-# Required: UTURN_EXTERNAL_IP must be set
+# Optional: UTURN_EXTERNAL_IP (auto-detected via STUN if unset;
+#   UTURN_STUN_SERVERS overrides the servers used)
 # Auth (one required, or UTURN_ALLOW_ANONYMOUS=true):
 #   UTURN_USERS (user:pass,...) and/or UTURN_AUTH_SECRET (TURN REST API secret)
 # Optional: UTURN_PORT, UTURN_REALM, UTURN_LOG_LEVEL
