@@ -1,6 +1,6 @@
 [package]
 name = "uturn"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 authors = ["Per Enstedt <per.enstedt@eyevinn.se>"]
 description = "Single-port TURN relay for WebRTC — internal and external routing over one UDP port"
