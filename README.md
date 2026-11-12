@@ -66,7 +66,7 @@ When Client A sends data to the relay address, uTURN:
 # Build
 cargo build --release
 
-# Run with authentication
+# Run with authentication (--external-ip is optional; auto-detected via STUN if omitted)
 ./target/release/uturn \
     --external-ip 203.0.113.1 \
     --port 3478 \
@@ -84,7 +84,8 @@ docker run -p 3478:3478/udp \
 | Option | Env Var | Default | Description |
 |--------|---------|---------|-------------|
 | `--port` | `UTURN_PORT` | 3478 | UDP listen port |
-| `--external-ip` | `UTURN_EXTERNAL_IP` | (required) | Public IP for relay addresses |
+| `--external-ip` | `UTURN_EXTERNAL_IP` | auto-detect | Public IP for relay addresses. If unset, detected at startup via STUN (IPv4 only) |
+| `--stun-server` | `UTURN_STUN_SERVERS` | `stun.l.google.com:19302,stun.cloudflare.com:3478` | STUN servers used for auto-detection, queried in parallel; first answer wins |
 | `--realm` | `UTURN_REALM` | uturn | TURN realm for authentication |
 | `--user` | `UTURN_USERS` | - | Credentials in `user:pass` format (repeatable) |
 | `--static-auth-secret` | `UTURN_AUTH_SECRET` | - | Shared secret for time-limited credentials, min 16 bytes (see below) |
@@ -92,6 +93,8 @@ docker run -p 3478:3478/udp \
 | `--max-allocations-per-ip` | `UTURN_MAX_ALLOC_PER_IP` | 200 | Max concurrent allocations per IP (0 = unlimited) |
 | `--rate-limit-per-minute` | `UTURN_RATE_LIMIT` | 30 | Max allocation requests per IP per minute (0 = unlimited) |
 | `--nonce-lifetime-secs` | `UTURN_NONCE_LIFETIME` | 3600 | Nonce validity period in seconds |
+
+> **Auto-detection finds the egress IP.** It reports the address the host's outbound traffic leaves from. If clients reach uTURN on a different address — e.g. behind a cloud LoadBalancer, or where outbound traffic goes through a separate NAT gateway — set `--external-ip` explicitly.
 
 ## Time-limited credentials (TURN REST API)
 

@@ -3,7 +3,7 @@
 //! Client-to-client traffic through the shared relay address is routed by ICE
 //! ufrag, so both sides must be ICE agents. See ARCHITECTURE.md for scope.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use tokio::signal;
 use tracing::{error, info, warn, Level};
@@ -30,9 +30,21 @@ struct Args {
     #[arg(short, long, env = "UTURN_PORT", default_value = "3478")]
     port: u16,
 
-    /// External/public IP address for relay addresses
+    /// External/public IP address for relay addresses. If omitted, it is
+    /// auto-detected at startup with a STUN Binding request to the
+    /// `--stun-server` list (IPv4 only; set it explicitly for IPv6).
     #[arg(short, long, env = "UTURN_EXTERNAL_IP")]
-    external_ip: std::net::IpAddr,
+    external_ip: Option<std::net::IpAddr>,
+
+    /// STUN servers (host:port) used to auto-detect the external IP when
+    /// `--external-ip` is not set. Queried in parallel; the first answer wins.
+    #[arg(
+        long,
+        env = "UTURN_STUN_SERVERS",
+        value_delimiter = ',',
+        default_values_t = uturn::discover::DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string())
+    )]
+    stun_server: Vec<String>,
 
     /// TURN realm
     #[arg(short, long, env = "UTURN_REALM", default_value = "uturn")]
@@ -125,12 +137,25 @@ async fn main() -> Result<()> {
         bail!("missing credentials");
     }
 
+    let external_ip = match args.external_ip {
+        Some(ip) => ip,
+        None => {
+            info!("No external IP configured, detecting via STUN");
+            uturn::discover::discover_public_ip(&args.stun_server, STUN_DISCOVERY_TIMEOUT)
+                .await
+                .context(
+                    "could not auto-detect the external IP; \
+                     set --external-ip (or UTURN_EXTERNAL_IP)",
+                )?
+        }
+    };
+
     // Generate random nonce secret at startup
     let nonce_secret: [u8; 16] = rand::random();
 
     let config = Config {
         port: args.port,
-        external_ip: args.external_ip,
+        external_ip,
         realm: args.realm,
         credentials,
         auth_secrets,
@@ -178,6 +203,9 @@ async fn main() -> Result<()> {
         }
     }
 }
+
+/// How long to wait for any STUN server to answer during IP auto-detection.
+const STUN_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Minimum length of a TURN REST API shared secret, in bytes.
 const MIN_AUTH_SECRET_LEN: usize = 16;
@@ -290,6 +318,16 @@ mod tests {
         assert_eq!(
             parse_auth_secrets(&args.static_auth_secret).unwrap(),
             strings(&[A])
+        );
+    }
+
+    #[test]
+    fn external_ip_is_optional_with_default_stun_servers() {
+        let args = Args::try_parse_from(["uturn", "--user", "u:p"]).unwrap();
+        assert!(args.external_ip.is_none());
+        assert_eq!(
+            args.stun_server,
+            strings(uturn::discover::DEFAULT_STUN_SERVERS)
         );
     }
 }
