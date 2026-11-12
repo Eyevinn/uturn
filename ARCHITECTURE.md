@@ -78,6 +78,16 @@ The server binds a single `tokio::net::UdpSocket` (via `socket2` so receive/send
 buffers can be raised). All packets (STUN, TURN, RTP, DTLS) arrive here and are
 dispatched to the demultiplexer.
 
+The relay address advertised to clients is `external_ip:port`. If no external
+IP is configured, `discover.rs` detects it once at startup, before the socket
+is bound: it sends a STUN Binding request from a separate ephemeral IPv4 socket
+to every configured STUN server in parallel (default: Google and Cloudflare)
+and takes the first valid XOR-MAPPED-ADDRESS. DNS resolution and retransmits
+share a single 5 s deadline; if no server answers, startup fails rather than
+advertising a wrong address. The result is the *egress* IP, so deployments
+where ingress differs (cloud LoadBalancer, separate NAT gateway) must set it
+explicitly.
+
 ### 2. Demultiplexer
 
 Identifies packet type and routes to appropriate handler.
@@ -463,6 +473,7 @@ uturn/
 │   ├── config.rs            # Configuration
 │   ├── server.rs            # Main server loop, packet dispatch
 │   ├── coarse_time.rs       # Low-overhead monotonic timestamps
+│   ├── discover.rs          # External IP auto-detection via STUN
 │   │
 │   ├── transport/
 │   │   ├── mod.rs
