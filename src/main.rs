@@ -103,7 +103,7 @@ struct Args {
     /// may still relay to, e.g. an SFU sharing the public IP on another port.
     /// By default every port on the external IP except the relay port is
     /// refused. Comma-separated; exact matches only.
-    #[arg(long, env = "UTURN_ALLOWED_PEERS", value_delimiter = ',')]
+    #[arg(long, env = "UTURN_ALLOWED_PEERS", value_delimiter = ',', value_parser = parse_peer_addr)]
     allowed_peer: Vec<std::net::SocketAddr>,
 }
 
@@ -195,6 +195,16 @@ async fn main() -> Result<()> {
             "Allowed peers on the external IP: {:?}",
             config.allowed_peers
         );
+        for peer in &config.allowed_peers {
+            if peer.ip() != config.external_ip {
+                warn!(
+                    "Allowed peer {} has no effect: its IP is not the external IP {}. \
+                     Only targets on the external IP need listing; loopback and other \
+                     forbidden addresses cannot be allowed.",
+                    peer, config.external_ip
+                );
+            }
+        }
     }
 
     if !config.auth_enabled() {
@@ -224,6 +234,14 @@ const STUN_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 /// Minimum length of a TURN REST API shared secret, in bytes.
 const MIN_AUTH_SECRET_LEN: usize = 16;
+
+/// Parse one `--allowed-peer` entry, ignoring surrounding whitespace so
+/// `UTURN_ALLOWED_PEERS="a:1, b:2"` works.
+fn parse_peer_addr(s: &str) -> std::result::Result<std::net::SocketAddr, String> {
+    s.trim()
+        .parse()
+        .map_err(|e| format!("invalid ip:port {:?}: {}", s.trim(), e))
+}
 
 /// Split `--static-auth-secret` values into secrets.
 ///
@@ -334,6 +352,26 @@ mod tests {
             parse_auth_secrets(&args.static_auth_secret).unwrap(),
             strings(&[A])
         );
+    }
+
+    #[test]
+    fn allowed_peers_parse_comma_separated_with_spaces() {
+        // Same delimiter and parser as UTURN_ALLOWED_PEERS.
+        let args = Args::try_parse_from([
+            "uturn",
+            "--user",
+            "u:p",
+            "--allowed-peer",
+            "203.0.113.10:30029, 203.0.113.10:30031",
+        ])
+        .unwrap();
+        let sa = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        assert_eq!(
+            args.allowed_peer,
+            vec![sa("203.0.113.10:30029"), sa("203.0.113.10:30031")]
+        );
+        assert!(Args::try_parse_from(["uturn", "--allowed-peer", "bogus"]).is_err());
+        assert!(Args::try_parse_from(["uturn", "--allowed-peer", "203.0.113.10"]).is_err());
     }
 
     #[test]
