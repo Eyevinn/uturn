@@ -93,8 +93,11 @@ docker run -p 3478:3478/udp \
 | `--max-allocations-per-ip` | `UTURN_MAX_ALLOC_PER_IP` | 200 | Max concurrent allocations per IP (0 = unlimited) |
 | `--rate-limit-per-minute` | `UTURN_RATE_LIMIT` | 30 | Max allocation requests per IP per minute (0 = unlimited) |
 | `--nonce-lifetime-secs` | `UTURN_NONCE_LIFETIME` | 3600 | Nonce validity period in seconds |
+| `--allowed-peer` | `UTURN_ALLOWED_PEERS` | - | `ip:port` targets on the relay's own external IP that clients may relay to (comma-separated, exact match). See below |
 
 > **Auto-detection finds the egress IP.** It reports the address the host's outbound traffic leaves from. If clients reach uTURN on a different address — e.g. behind a cloud LoadBalancer, or where outbound traffic goes through a separate NAT gateway — set `--external-ip` explicitly.
+
+> **Services on the same public IP.** uTURN refuses to relay to its own external IP on any port other than the relay port, so a client cannot reach other UDP services on the relay host. If another service you *do* want reachable shares that IP (e.g. an SFU behind the same NAT on another port), list it: `UTURN_ALLOWED_PEERS=203.0.113.1:30029`. Traffic then goes to the public address from inside your network, so the NAT must support hairpinning. Loopback, link-local and multicast stay forbidden regardless.
 
 ## Time-limited credentials (TURN REST API)
 

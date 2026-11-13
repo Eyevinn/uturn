@@ -1,6 +1,6 @@
 //! Server configuration
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::turn::TurnAuth;
 
@@ -53,6 +53,13 @@ pub struct Config {
     /// Maximum number of bound channels per allocation.
     /// Exceeding this returns 508 Insufficient Capacity. (RFC 5766 §11.2)
     pub max_channels_per_alloc: usize,
+
+    /// Peer transport addresses exempt from the "own external IP on a
+    /// non-relay port" rule. For a service that shares the relay's public IP
+    /// on another port (e.g. an SFU behind the same NAT). Exact `ip:port`
+    /// matches only; loopback, multicast and the other IP-level rules still
+    /// apply.
+    pub allowed_peers: Vec<SocketAddr>,
 }
 
 /// Redacts passwords and secrets, so logging a `Config` cannot leak them.
@@ -75,6 +82,7 @@ impl std::fmt::Debug for Config {
             .field("allow_anonymous", &self.allow_anonymous)
             .field("max_permissions_per_alloc", &self.max_permissions_per_alloc)
             .field("max_channels_per_alloc", &self.max_channels_per_alloc)
+            .field("allowed_peers", &self.allowed_peers)
             .finish()
     }
 }
@@ -97,12 +105,19 @@ impl Config {
             allow_anonymous: false,
             max_permissions_per_alloc: 64,
             max_channels_per_alloc: 128,
+            allowed_peers: Vec::new(),
         }
     }
 
     /// Set the listen port
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    /// Exempt a peer address from the own-external-IP rule
+    pub fn with_allowed_peer(mut self, addr: SocketAddr) -> Self {
+        self.allowed_peers.push(addr);
         self
     }
 

@@ -98,6 +98,13 @@ struct Args {
     /// Maximum number of bound channels per allocation
     #[arg(long, env = "UTURN_MAX_CHANNELS", default_value = "128")]
     max_channels_per_alloc: usize,
+
+    /// Peer addresses (ip:port) on the relay's own external IP that clients
+    /// may still relay to, e.g. an SFU sharing the public IP on another port.
+    /// By default every port on the external IP except the relay port is
+    /// refused. Comma-separated; exact matches only.
+    #[arg(long, env = "UTURN_ALLOWED_PEERS", value_delimiter = ',')]
+    allowed_peer: Vec<std::net::SocketAddr>,
 }
 
 #[tokio::main]
@@ -166,6 +173,7 @@ async fn main() -> Result<()> {
         allow_anonymous: args.allow_anonymous,
         max_permissions_per_alloc: args.max_permissions_per_alloc,
         max_channels_per_alloc: args.max_channels_per_alloc,
+        allowed_peers: args.allowed_peer,
     };
 
     info!(
@@ -179,6 +187,13 @@ async fn main() -> Result<()> {
         info!(
             "TURN REST API credentials enabled ({} shared secret(s))",
             config.auth_secrets.len()
+        );
+    }
+
+    if !config.allowed_peers.is_empty() {
+        info!(
+            "Allowed peers on the external IP: {:?}",
+            config.allowed_peers
         );
     }
 
