@@ -59,9 +59,15 @@ pub(crate) fn is_forbidden_peer_ip(ip: IpAddr) -> bool {
 /// would let a client reach other UDP services on the relay host. Applied to
 /// Send indications, ChannelBind and the ChannelData egress alike so the two
 /// data paths cannot be played against each other.
+///
+/// `config.allowed_peers` exempts exact `ip:port` targets from the external-IP
+/// rule (a service sharing the relay's public IP), never from the IP-level
+/// rules.
 pub(crate) fn is_forbidden_peer_addr(config: &Config, addr: SocketAddr) -> bool {
     is_forbidden_peer_ip(addr.ip())
-        || (addr.ip() == config.external_ip && addr.port() != config.port)
+        || (addr.ip() == config.external_ip
+            && addr.port() != config.port
+            && !config.allowed_peers.contains(&addr))
 }
 
 /// Where a Send indication's payload should go once the sender's own
@@ -1902,6 +1908,26 @@ mod tests {
         assert!(is_forbidden_peer_addr(&cfg, sa("127.0.0.1:3478")));
         // Unrelated hosts are fine on any port.
         assert!(!is_forbidden_peer_addr(&cfg, sa("203.0.113.11:53")));
+    }
+
+    #[test]
+    fn forbidden_peer_addr_respects_allowed_peers() {
+        use super::is_forbidden_peer_addr;
+        use crate::config::Config;
+        let sa = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        let cfg = Config::new(ip("203.0.113.10"))
+            .with_port(3478)
+            .with_allowed_peer(sa("203.0.113.10:30029"))
+            .with_allowed_peer(sa("127.0.0.1:30029"));
+        // The listed port on our own external IP is allowed...
+        assert!(!is_forbidden_peer_addr(&cfg, sa("203.0.113.10:30029")));
+        // ...but only that exact port.
+        assert!(is_forbidden_peer_addr(&cfg, sa("203.0.113.10:30030")));
+        assert!(is_forbidden_peer_addr(&cfg, sa("203.0.113.10:53")));
+        // The relay address itself is still fine.
+        assert!(!is_forbidden_peer_addr(&cfg, sa("203.0.113.10:3478")));
+        // The allow-list never overrides the IP-level rules.
+        assert!(is_forbidden_peer_addr(&cfg, sa("127.0.0.1:30029")));
     }
 
     #[test]
