@@ -105,6 +105,37 @@ struct Args {
     /// refused. Comma-separated; exact matches only.
     #[arg(long, env = "UTURN_ALLOWED_PEERS", value_delimiter = ',', value_parser = parse_peer_addr)]
     allowed_peer: Vec<std::net::SocketAddr>,
+
+    /// HTTP health endpoint (ip:port) for orchestrator probes, or `off`.
+    /// Serves only `GET /healthz` (and `HEAD`), which answers `ok` when the relay's UDP
+    /// port answers a STUN Binding request, `503` otherwise. Internal network
+    /// only: keep it off the public network. Default: 127.0.0.1:9040, and
+    /// failing to bind the default only logs a warning; an address given
+    /// here must bind or startup fails.
+    #[arg(long, env = "UTURN_HEALTH", value_parser = parse_health)]
+    health: Option<Health>,
+}
+
+/// Default health endpoint: loopback, so it is not exposed by accident. The
+/// Docker image sets `0.0.0.0:9040`.
+const DEFAULT_HEALTH: std::net::SocketAddr =
+    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9040);
+
+/// Where the health endpoint listens, if anywhere.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Health {
+    Off,
+    Listen(std::net::SocketAddr),
+}
+
+fn parse_health(s: &str) -> std::result::Result<Health, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("off") {
+        return Ok(Health::Off);
+    }
+    s.parse()
+        .map(Health::Listen)
+        .map_err(|e| format!("invalid ip:port {:?} (or `off`): {}", s, e))
 }
 
 #[tokio::main]
@@ -216,6 +247,33 @@ async fn main() -> Result<()> {
     }
 
     let server = Server::new(config).await?;
+
+    // The endpoint is on by default. A default that cannot bind (a second
+    // instance on the host, port 9040 taken) must not stop a relay that
+    // started fine before the endpoint existed; an address the operator set
+    // must bind.
+    let (health, explicit) = match args.health {
+        Some(h) => (h, true),
+        None => (Health::Listen(DEFAULT_HEALTH), false),
+    };
+    match health {
+        Health::Off => info!("Health endpoint disabled"),
+        Health::Listen(listen) => {
+            let targets = uturn::health::probe_targets(server.local_addr()?);
+            match uturn::health::spawn(listen, targets).await {
+                Ok(addr) => info!("Health endpoint on http://{}/healthz", addr),
+                Err(e) if !explicit => warn!(
+                    "Health endpoint disabled: could not bind the default {}: {} \
+                     (set --health to another address, or `off`)",
+                    listen, e
+                ),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("could not bind the health endpoint on {listen}"))
+                }
+            }
+        }
+    }
 
     // Run server with graceful shutdown on SIGTERM/SIGINT
     tokio::select! {
@@ -372,6 +430,21 @@ mod tests {
         );
         assert!(Args::try_parse_from(["uturn", "--allowed-peer", "bogus"]).is_err());
         assert!(Args::try_parse_from(["uturn", "--allowed-peer", "203.0.113.10"]).is_err());
+    }
+
+    #[test]
+    fn health_defaults_to_loopback_and_can_be_disabled() {
+        let args = Args::try_parse_from(["uturn", "--user", "u:p"]).unwrap();
+        assert_eq!(args.health, None);
+        assert_eq!(DEFAULT_HEALTH, "127.0.0.1:9040".parse().unwrap());
+        let args = Args::try_parse_from(["uturn", "--health", "off"]).unwrap();
+        assert_eq!(args.health, Some(Health::Off));
+        let args = Args::try_parse_from(["uturn", "--health", "0.0.0.0:9999"]).unwrap();
+        assert_eq!(
+            args.health,
+            Some(Health::Listen("0.0.0.0:9999".parse().unwrap()))
+        );
+        assert!(Args::try_parse_from(["uturn", "--health", "9040"]).is_err());
     }
 
     #[test]
