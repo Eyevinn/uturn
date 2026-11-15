@@ -259,6 +259,7 @@ Note: The `-y` self-test flag doesn't work with single-port TURN since client an
 - [x] Long-term credentials (RFC 5389)
 - [x] Time-limited credentials (TURN REST API / shared secret)
 - [x] Client-to-client relay (single-port mode, ICE ufrag routed)
+- [x] HTTP health endpoint for Kubernetes probes and load balancer health checks (`GET /healthz`, STUN self-check)
 - [ ] TCP TURN
 - [ ] TURNS (TLS/DTLS)
 
