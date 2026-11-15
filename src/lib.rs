@@ -22,6 +22,7 @@ pub mod coarse_time;
 pub mod config;
 pub mod demux;
 pub mod discover;
+pub mod health;
 pub mod lookup;
 pub mod relay;
 pub mod server;

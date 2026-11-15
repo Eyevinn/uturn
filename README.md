@@ -94,10 +94,77 @@ docker run -p 3478:3478/udp \
 | `--rate-limit-per-minute` | `UTURN_RATE_LIMIT` | 30 | Max allocation requests per IP per minute (0 = unlimited) |
 | `--nonce-lifetime-secs` | `UTURN_NONCE_LIFETIME` | 3600 | Nonce validity period in seconds |
 | `--allowed-peer` | `UTURN_ALLOWED_PEERS` | - | `ip:port` targets on the relay's own external IP that clients may relay to (comma-separated, exact match). See below |
+| `--health` | `UTURN_HEALTH` | `127.0.0.1:8081` (image: `0.0.0.0:8081`) | HTTP health endpoint (TCP) for probes, `off` to disable. Internal network only. See [Health endpoint](#health-endpoint) |
 
 > **Auto-detection finds the egress IP.** It reports the address the host's outbound traffic leaves from. If clients reach uTURN on a different address — e.g. behind a cloud LoadBalancer, or where outbound traffic goes through a separate NAT gateway — set `--external-ip` explicitly.
 
 > **Services on the same public IP.** uTURN refuses to relay to its own external IP on any port other than the relay port, so a client cannot reach other UDP services on the relay host. If another service you *do* want reachable shares that IP (e.g. an SFU behind the same NAT on another port), list it: `UTURN_ALLOWED_PEERS=203.0.113.1:30029`. Traffic then goes to the public address from inside your network, so the NAT must support hairpinning. Loopback, link-local and multicast stay forbidden regardless.
+
+## Health endpoint
+
+uTURN's relay port is UDP, which Kubernetes probes and AWS NLB health checks
+cannot test. `--health` adds a small HTTP listener on TCP that serves only
+`GET /healthz`:
+
+- `200 ok` when the relay answers: each request sends a STUN Binding request
+  to uTURN's own UDP port (on loopback when it listens on all interfaces) and
+  waits up to 800 ms for the response. So a pass means the receive loop is
+  alive, not just the process.
+- `503` when it does not.
+
+The self-check needs no credentials and creates no allocation, and it does not
+count against `--rate-limit-per-minute` or `--max-allocations-per-ip`.
+
+The binary listens on `127.0.0.1:8081` by default; the Docker image sets
+`UTURN_HEALTH=0.0.0.0:8081` so the kubelet and a load balancer can reach it.
+**Keep the health port off the public network**: do not publish it in
+`docker run -p` or list it on a public Service. Clients never need it.
+
+In Kubernetes, point the probes at it and, behind an AWS NLB, use it for the
+UDP target group's health check:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: uturn
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "8081"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /healthz
+spec:
+  type: LoadBalancer
+  selector:
+    app: uturn
+  ports:
+    - name: turn
+      port: 3478
+      protocol: UDP          # only the TURN port is on the Service
+---
+# In the Deployment's container spec:
+ports:
+  - name: turn
+    containerPort: 3478
+    protocol: UDP
+  - name: health
+    containerPort: 8081
+    protocol: TCP
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: health
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: health
+  failureThreshold: 3
+```
+
+The NLB checks the health port on the pod IP directly (`target-type: ip`), so
+it does not need to be on the Service. Its security group must allow the NLB
+to reach TCP 8081 on the pods.
 
 ## Time-limited credentials (TURN REST API)
 

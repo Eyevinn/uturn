@@ -105,6 +105,34 @@ struct Args {
     /// refused. Comma-separated; exact matches only.
     #[arg(long, env = "UTURN_ALLOWED_PEERS", value_delimiter = ',', value_parser = parse_peer_addr)]
     allowed_peer: Vec<std::net::SocketAddr>,
+
+    /// HTTP health endpoint (ip:port) for orchestrator probes, or `off`.
+    /// Serves only `GET /healthz`, which answers `ok` when the relay's UDP
+    /// port answers a STUN Binding request, `503` otherwise. Internal network
+    /// only: keep it off the public network.
+    #[arg(long, env = "UTURN_HEALTH", default_value = DEFAULT_HEALTH, value_parser = parse_health)]
+    health: Health,
+}
+
+/// Default health endpoint: loopback, so it is not exposed by accident. The
+/// Docker image sets `0.0.0.0:8081`.
+const DEFAULT_HEALTH: &str = "127.0.0.1:8081";
+
+/// Where the health endpoint listens, if anywhere.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Health {
+    Off,
+    Listen(std::net::SocketAddr),
+}
+
+fn parse_health(s: &str) -> std::result::Result<Health, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("off") {
+        return Ok(Health::Off);
+    }
+    s.parse()
+        .map(Health::Listen)
+        .map_err(|e| format!("invalid ip:port {:?} (or `off`): {}", s, e))
 }
 
 #[tokio::main]
@@ -216,6 +244,17 @@ async fn main() -> Result<()> {
     }
 
     let server = Server::new(config).await?;
+
+    match args.health {
+        Health::Off => info!("Health endpoint disabled"),
+        Health::Listen(listen) => {
+            let target = uturn::health::probe_target(server.local_addr()?);
+            let addr = uturn::health::spawn(listen, target)
+                .await
+                .with_context(|| format!("could not bind the health endpoint on {listen}"))?;
+            info!("Health endpoint on http://{}/healthz", addr);
+        }
+    }
 
     // Run server with graceful shutdown on SIGTERM/SIGINT
     tokio::select! {
@@ -372,6 +411,20 @@ mod tests {
         );
         assert!(Args::try_parse_from(["uturn", "--allowed-peer", "bogus"]).is_err());
         assert!(Args::try_parse_from(["uturn", "--allowed-peer", "203.0.113.10"]).is_err());
+    }
+
+    #[test]
+    fn health_defaults_to_loopback_and_can_be_disabled() {
+        let args = Args::try_parse_from(["uturn", "--user", "u:p"]).unwrap();
+        assert_eq!(
+            args.health,
+            Health::Listen("127.0.0.1:8081".parse().unwrap())
+        );
+        let args = Args::try_parse_from(["uturn", "--health", "off"]).unwrap();
+        assert_eq!(args.health, Health::Off);
+        let args = Args::try_parse_from(["uturn", "--health", "0.0.0.0:9999"]).unwrap();
+        assert_eq!(args.health, Health::Listen("0.0.0.0:9999".parse().unwrap()));
+        assert!(Args::try_parse_from(["uturn", "--health", "8081"]).is_err());
     }
 
     #[test]
