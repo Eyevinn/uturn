@@ -89,7 +89,7 @@ where ingress differs (cloud LoadBalancer, separate NAT gateway) must set it
 explicitly.
 
 Besides the relay socket there is one optional TCP listener, the health
-endpoint (`--health`, default `127.0.0.1:8081`). It serves only `GET /healthz`
+endpoint (`--health`, default `127.0.0.1:9040`). It serves only `GET /healthz` (and `HEAD`)
 and answers it by sending a STUN Binding request to the relay's own UDP port,
 so it reports whether the receive loop is answering. It carries no relay
 traffic.

@@ -20,13 +20,13 @@ COPY --from=builder /build/target/release/uturn /usr/local/bin/uturn
 
 # Default port (>1024 so unprivileged user can bind). If a port <1024 is
 # needed, grant CAP_NET_BIND_SERVICE at runtime or override USER.
-# 3478/udp: TURN, the public port. 8081/tcp: the health endpoint (GET /healthz)
+# 3478/udp: TURN, the public port. 9040/tcp: the health endpoint (GET /healthz)
 # for orchestrator probes and load balancer health checks, internal network only.
-EXPOSE 3478/udp 8081/tcp
+EXPOSE 3478/udp 9040/tcp
 
 # The binary's own health default is loopback; in a container it has to listen
 # on all interfaces to be reachable. Set UTURN_HEALTH=off to disable it.
-ENV UTURN_HEALTH=0.0.0.0:8081
+ENV UTURN_HEALTH=0.0.0.0:9040
 
 # Optional: UTURN_EXTERNAL_IP (auto-detected via STUN if unset;
 #   UTURN_STUN_SERVERS overrides the servers used)

@@ -22,7 +22,7 @@ pub const DEFAULT_STUN_SERVERS: &[&str] = &["stun.l.google.com:19302", "stun.clo
 /// Binding request message type (method 0x001, class request).
 const BINDING_REQUEST: u16 = 0x0001;
 /// Binding success response message type.
-const BINDING_SUCCESS: u16 = 0x0101;
+pub(crate) const BINDING_SUCCESS: u16 = 0x0101;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
 /// Interval between retransmissions of the Binding requests.
@@ -109,7 +109,7 @@ pub async fn discover_public_ip(servers: &[String], total_timeout: Duration) -> 
 }
 
 /// Build a bare STUN Binding request (RFC 5389, no attributes).
-fn binding_request(tid: &[u8; 12]) -> [u8; 20] {
+pub(crate) fn binding_request(tid: &[u8; 12]) -> [u8; 20] {
     let mut msg = [0u8; 20];
     msg[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
     // Length stays 0.
@@ -118,14 +118,18 @@ fn binding_request(tid: &[u8; 12]) -> [u8; 20] {
     msg
 }
 
+/// Whether `data` is a Binding success response to the transaction `tid`.
+pub(crate) fn is_binding_success(data: &[u8], tid: &[u8; 12]) -> bool {
+    data.len() >= 20
+        && u16::from_be_bytes([data[0], data[1]]) == BINDING_SUCCESS
+        && u32::from_be_bytes([data[4], data[5], data[6], data[7]]) == STUN_MAGIC_COOKIE
+        && &data[8..20] == tid
+}
+
 /// Extract XOR-MAPPED-ADDRESS from a Binding success response with the given
 /// transaction ID.
 fn parse_binding_response(data: &[u8], tid: &[u8; 12]) -> Option<SocketAddr> {
-    if data.len() < 20
-        || u16::from_be_bytes([data[0], data[1]]) != BINDING_SUCCESS
-        || u32::from_be_bytes([data[4], data[5], data[6], data[7]]) != STUN_MAGIC_COOKIE
-        || &data[8..20] != tid
-    {
+    if !is_binding_success(data, tid) {
         return None;
     }
     let len = u16::from_be_bytes([data[2], data[3]]) as usize;

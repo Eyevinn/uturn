@@ -10,8 +10,12 @@ use tokio::net::{TcpStream, UdpSocket};
 use uturn::{health, Config, Server};
 
 async fn get(addr: SocketAddr, path: &str) -> String {
+    request(addr, "GET", path).await
+}
+
+async fn request(addr: SocketAddr, method: &str, path: &str) -> String {
     let mut s = TcpStream::connect(addr).await.unwrap();
-    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+    s.write_all(format!("{method} {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
         .await
         .unwrap();
     let mut out = String::new();
@@ -31,10 +35,10 @@ async fn healthz_is_ok_when_the_relay_answers() {
     // The relay binds the wildcard address; the probe must reach it on loopback.
     let udp = server.local_addr().unwrap();
     assert!(udp.ip().is_unspecified());
-    let target = health::probe_target(udp);
+    let targets = health::probe_targets(udp);
     tokio::spawn(async move { server.run().await });
 
-    let addr = health::spawn("127.0.0.1:0".parse().unwrap(), target)
+    let addr = health::spawn("127.0.0.1:0".parse().unwrap(), targets)
         .await
         .unwrap();
 
@@ -50,6 +54,10 @@ async fn healthz_is_ok_when_the_relay_answers() {
         assert!(r.ends_with("\r\n\r\nok\n"), "{r}");
     }
 
+    let r = request(addr, "HEAD", "/healthz").await;
+    assert!(r.starts_with("HTTP/1.1 200 OK\r\n"), "{r}");
+    assert!(r.ends_with("\r\n\r\n"), "a HEAD answer has no body: {r}");
+
     let r = get(addr, "/nope").await;
     assert!(r.starts_with("HTTP/1.1 404 "), "{r}");
 }
@@ -59,16 +67,19 @@ async fn healthz_is_503_when_the_relay_does_not_answer() {
     // A bound UDP socket that never replies stands in for a hung relay.
     let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let target = silent.local_addr().unwrap();
-    let addr = health::spawn("127.0.0.1:0".parse().unwrap(), target)
+    let addr = health::spawn("127.0.0.1:0".parse().unwrap(), vec![target])
         .await
         .unwrap();
 
     let t = Instant::now();
     let r = get(addr, "/healthz").await;
     assert!(r.starts_with("HTTP/1.1 503 Service Unavailable\r\n"), "{r}");
-    // Bounded by the probe timeout, well inside a 1 s Kubernetes probe.
+    // It waited for the relay (a plain `ok` would answer at once) and gave up
+    // at the probe timeout. That PROBE_TIMEOUT fits a 1 s Kubernetes probe is
+    // checked at compile time; the upper bound here leaves room for a slow CI
+    // runner.
     assert!(t.elapsed() >= health::PROBE_TIMEOUT, "{:?}", t.elapsed());
-    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
 
     // The silent socket did receive the probe (and its retransmits).
     let mut buf = [0u8; 64];

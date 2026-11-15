@@ -1,5 +1,6 @@
 //! A tiny HTTP health endpoint for orchestrators (readiness/liveness probes
-//! and load balancer health checks): `GET /healthz`. Nothing else is served.
+//! and load balancer health checks): `GET /healthz` (and `HEAD`). Nothing else
+//! is served.
 //! Meant for the internal network only.
 //!
 //! `/healthz` proves the relay path, not just that this task runs: each
@@ -15,6 +16,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,9 +24,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, timeout_at, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::demux::stun::STUN_MAGIC_COOKIE;
+use crate::discover::{binding_request, is_binding_success};
 
 /// Connections handled at once; more are closed right away.
 const MAX_CONNS: usize = 32;
@@ -40,36 +42,71 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// timeout of a Kubernetes probe, so a hung relay gets a 503 rather than a
 /// probe timeout.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+const _: () = assert!(PROBE_TIMEOUT.as_millis() < 1000);
 /// The self-check request is sent again after this long without an answer,
 /// in case a busy receive buffer dropped it.
 const PROBE_RETRANSMIT: Duration = Duration::from_millis(250);
 
-const BINDING_REQUEST: u16 = 0x0001;
-const BINDING_SUCCESS: u16 = 0x0101;
-
-/// The address the self-check sends to, given the relay socket's local
-/// address: loopback of the same family when the socket is bound to the
-/// wildcard address, otherwise the bound address itself.
-pub fn probe_target(udp_local: SocketAddr) -> SocketAddr {
-    let ip = match udp_local.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ip => ip,
-    };
-    SocketAddr::new(ip, udp_local.port())
+/// The addresses the self-check sends to, given the relay socket's local
+/// address: loopback when the socket is bound to the wildcard address,
+/// otherwise the bound address itself. For `[::]` that is both `::1` and the
+/// IPv4-mapped `127.0.0.1`: a container with IPv6 disabled has no `::1`, but
+/// a dual-stack socket still answers on the IPv4 loopback.
+pub fn probe_targets(udp_local: SocketAddr) -> Vec<SocketAddr> {
+    let port = udp_local.port();
+    match udp_local.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)]
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() => vec![
+            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(), port),
+        ],
+        ip => vec![SocketAddr::new(ip, port)],
+    }
 }
 
 /// Binds `listen` and serves the health endpoint on a background task. Each
-/// `/healthz` request checks the relay at `udp_target` (see
-/// [`probe_target`]). Returns the bound address.
-pub async fn spawn(listen: SocketAddr, udp_target: SocketAddr) -> io::Result<SocketAddr> {
+/// `/healthz` request checks the relay at `udp_targets` (see
+/// [`probe_targets`]); an answer from any of them passes. Returns the bound
+/// address.
+pub async fn spawn(listen: SocketAddr, udp_targets: Vec<SocketAddr>) -> io::Result<SocketAddr> {
+    assert!(!udp_targets.is_empty(), "health probe needs a target");
     let listener = TcpListener::bind(listen).await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(serve(listener, udp_target));
+    tokio::spawn(serve(listener, Probe::new(udp_targets)));
     Ok(addr)
 }
 
-async fn serve(listener: TcpListener, udp_target: SocketAddr) {
+/// The relay to check, and the last result, so a relay that stays down is
+/// logged once rather than on every probe.
+struct Probe {
+    targets: Vec<SocketAddr>,
+    healthy: AtomicBool,
+}
+
+impl Probe {
+    fn new(targets: Vec<SocketAddr>) -> Arc<Self> {
+        Arc::new(Self {
+            targets,
+            healthy: AtomicBool::new(true),
+        })
+    }
+
+    async fn check(&self) -> bool {
+        let result = self_check(&self.targets).await;
+        let was = self.healthy.swap(result.is_ok(), Ordering::Relaxed);
+        match (&result, was) {
+            (Err(e), true) => warn!("Health check failed: relay at {:?} {}", self.targets, e),
+            (Err(e), false) => debug!("Health check still failing: {}", e),
+            (Ok(()), false) => info!("Health check passes again"),
+            (Ok(()), true) => {}
+        }
+        result.is_ok()
+    }
+}
+
+async fn serve(listener: TcpListener, probe: Arc<Probe>) {
     let slots = Arc::new(Semaphore::new(MAX_CONNS));
     let mut failing = false;
     loop {
@@ -91,32 +128,40 @@ async fn serve(listener: TcpListener, udp_target: SocketAddr) {
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             continue;
         };
+        let probe = probe.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle(stream, udp_target).await {
+            if let Err(e) = handle(stream, &probe).await {
                 debug!("Health connection ended: {}", e);
             }
         });
     }
 }
 
-async fn handle(mut stream: TcpStream, udp_target: SocketAddr) -> io::Result<()> {
+async fn handle(mut stream: TcpStream, probe: &Probe) -> io::Result<()> {
+    let mut is_head = false;
     let (status, body) = match read_head(&mut stream).await? {
-        Some(head) => match route(&head) {
-            Route::Healthz => match self_check(udp_target).await {
-                Ok(()) => ("200 OK", "ok\n"),
-                Err(e) => {
-                    warn!("Health check failed: relay at {} {}", udp_target, e);
-                    ("503 Service Unavailable", "relay not responding\n")
-                }
-            },
-            Route::Respond(status, body) => (status, body),
-        },
+        Some(head) => {
+            is_head = head.starts_with(b"HEAD ");
+            match route(&head) {
+                Route::Healthz if probe.check().await => ("200 OK", "ok\n"),
+                Route::Healthz => ("503 Service Unavailable", "relay not responding\n"),
+                Route::Respond(status, body) => (status, body),
+            }
+        }
         None => bad_request(),
     };
+    // RFC 9110 section 15.5.6: a 405 must list the allowed methods.
+    let allow = if status.starts_with("405") {
+        "Allow: GET, HEAD\r\n"
+    } else {
+        ""
+    };
+    // A HEAD response carries the headers of the GET response, no body.
+    let payload = if is_head { "" } else { body };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
-         Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+         {allow}Cache-Control: no-store\r\nConnection: close\r\n\r\n{payload}",
         body.len()
     );
     timeout(WRITE_DEADLINE, async {
@@ -127,11 +172,15 @@ async fn handle(mut stream: TcpStream, udp_target: SocketAddr) -> io::Result<()>
     .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
 }
 
-/// Sends a STUN Binding request to the relay and waits for the matching
-/// success response. The error describes what went wrong, phrased to follow
+/// Sends a STUN Binding request to each of the relay's addresses and waits
+/// for a matching success response from any of them. All targets must be of
+/// one address family. The error describes what went wrong, phrased to follow
 /// "relay at <addr>".
-pub async fn self_check(udp_target: SocketAddr) -> Result<(), String> {
-    let bind: SocketAddr = match udp_target {
+pub async fn self_check(udp_targets: &[SocketAddr]) -> Result<(), String> {
+    let Some(&first) = udp_targets.first() else {
+        return Err("has no address to probe".into());
+    };
+    let bind: SocketAddr = match first {
         SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
         SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
     };
@@ -146,8 +195,10 @@ pub async fn self_check(udp_target: SocketAddr) -> Result<(), String> {
     while Instant::now() < deadline {
         // A send error (e.g. ICMP port unreachable reported on a previous
         // round) is not final: the relay may still answer the next one.
-        if let Err(e) = socket.send_to(&request, udp_target).await {
-            debug!("Health probe send to {} failed: {}", udp_target, e);
+        for &target in udp_targets {
+            if let Err(e) = socket.send_to(&request, target).await {
+                debug!("Health probe send to {} failed: {}", target, e);
+            }
         }
         let round_end = (Instant::now() + PROBE_RETRANSMIT).min(deadline);
         loop {
@@ -155,7 +206,7 @@ pub async fn self_check(udp_target: SocketAddr) -> Result<(), String> {
                 Ok(Ok((len, _))) if is_binding_success(&buf[..len], &tid) => return Ok(()),
                 Ok(Ok(_)) => continue,
                 Ok(Err(e)) => {
-                    debug!("Health probe recv from {} failed: {}", udp_target, e);
+                    debug!("Health probe recv failed: {}", e);
                     // Avoid a busy loop on a socket that errors immediately.
                     tokio::time::sleep_until(round_end).await;
                     break;
@@ -167,22 +218,6 @@ pub async fn self_check(udp_target: SocketAddr) -> Result<(), String> {
     Err(format!(
         "did not answer a STUN Binding request within {PROBE_TIMEOUT:?}"
     ))
-}
-
-/// A bare STUN Binding request (RFC 5389, no attributes).
-fn binding_request(tid: &[u8; 12]) -> [u8; 20] {
-    let mut msg = [0u8; 20];
-    msg[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
-    msg[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-    msg[8..20].copy_from_slice(tid);
-    msg
-}
-
-fn is_binding_success(data: &[u8], tid: &[u8; 12]) -> bool {
-    data.len() >= 20
-        && u16::from_be_bytes([data[0], data[1]]) == BINDING_SUCCESS
-        && u32::from_be_bytes([data[4], data[5], data[6], data[7]]) == STUN_MAGIC_COOKIE
-        && &data[8..20] == tid
 }
 
 /// Reads the request head up to and including the blank line, so that
@@ -255,8 +290,8 @@ fn route(head: &[u8]) -> Route {
     }
     let path = target.split('?').next().unwrap_or_default();
     match (method, path) {
-        ("GET", "/healthz") => Route::Healthz,
-        ("GET", _) => Route::Respond("404 Not Found", "not found\n"),
+        ("GET" | "HEAD", "/healthz") => Route::Healthz,
+        ("GET" | "HEAD", _) => Route::Respond("404 Not Found", "not found\n"),
         _ => Route::Respond("405 Method Not Allowed", "method not allowed\n"),
     }
 }
@@ -264,6 +299,7 @@ fn route(head: &[u8]) -> Route {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discover::BINDING_SUCCESS;
 
     #[test]
     fn routes() {
@@ -276,6 +312,7 @@ mod tests {
             "healthz"
         );
         assert_eq!(status(b"GET /healthz?x=1 HTTP/1.0\n\n"), "healthz");
+        assert_eq!(status(b"HEAD /healthz HTTP/1.1\r\n\r\n"), "healthz");
         assert_eq!(status(b"GET /nope HTTP/1.1\r\n\r\n"), "404 Not Found");
         assert_eq!(
             status(b"POST /healthz HTTP/1.1\r\n\r\n"),
@@ -295,11 +332,14 @@ mod tests {
     }
 
     #[test]
-    fn probe_target_uses_loopback_for_wildcard() {
+    fn probe_targets_use_loopback_for_wildcard() {
         let sa = |s: &str| s.parse::<SocketAddr>().unwrap();
-        assert_eq!(probe_target(sa("0.0.0.0:3478")), sa("127.0.0.1:3478"));
-        assert_eq!(probe_target(sa("[::]:3478")), sa("[::1]:3478"));
-        assert_eq!(probe_target(sa("192.0.2.5:3478")), sa("192.0.2.5:3478"));
+        assert_eq!(probe_targets(sa("0.0.0.0:3478")), [sa("127.0.0.1:3478")]);
+        assert_eq!(
+            probe_targets(sa("[::]:3478")),
+            [sa("[::1]:3478"), sa("[::ffff:127.0.0.1]:3478")]
+        );
+        assert_eq!(probe_targets(sa("192.0.2.5:3478")), [sa("192.0.2.5:3478")]);
     }
 
     #[test]
