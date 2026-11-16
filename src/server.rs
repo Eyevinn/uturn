@@ -103,6 +103,11 @@ impl Server {
         })
     }
 
+    /// The local address of the relay's UDP socket (useful with port 0).
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
     /// Run the server main loop
     pub async fn run(&self) -> Result<()> {
         info!(
