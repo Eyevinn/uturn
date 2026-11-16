@@ -12,24 +12,31 @@ const [USER, PASS] = process.env.TURN_SECRET
     })()
   : ['test', 'testpass'];
 const RESTART = process.env.ICE_RESTART === '1';
+// PEER2_DIRECT=1: only the first peer uses TURN (forced relay); the second has
+// no TURN server and is reached as an external peer. Exercises the
+// client-to-external-peer path, including STUN from the peer.
+const PEER2_DIRECT = process.env.PEER2_DIRECT === '1';
 
 (async () => {
   const browser = await chromium.launch({
     ...(process.env.CHROMIUM_PATH ? { executablePath: process.env.CHROMIUM_PATH } : {}),
-    args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    // Real host IPs instead of mDNS names, so the TURN peer can create a
+    // permission for the direct peer's address.
+    args: ['--no-sandbox', '--disable-dev-shm-usage',
+           '--disable-features=WebRtcHideLocalIpsWithMdns'],
   });
   const page = await browser.newPage();
   page.on('console', m => console.log('  [browser]', m.text()));
   await page.goto('about:blank');
 
-  const result = await page.evaluate(async ({ TURN, USER, PASS, RESTART }) => {
+  const result = await page.evaluate(async ({ TURN, USER, PASS, RESTART, PEER2_DIRECT }) => {
     const log = [];
     const cfg = {
       iceServers: [{ urls: TURN, username: USER, credential: PASS }],
       iceTransportPolicy: 'relay',
     };
     const pc1 = new RTCPeerConnection(cfg);
-    const pc2 = new RTCPeerConnection(cfg);
+    const pc2 = new RTCPeerConnection(PEER2_DIRECT ? {} : cfg);
 
     // Direct signalling: hand candidates straight across.
     pc1.onicecandidate = e => e.candidate && pc2.addIceCandidate(e.candidate);
@@ -98,7 +105,7 @@ const RESTART = process.env.ICE_RESTART === '1';
     return { ok: true, log, pair, restart,
              ice1: pc1.iceConnectionState, ice2: pc2.iceConnectionState,
              conn1: pc1.connectionState, conn2: pc2.connectionState };
-  }, { TURN, USER, PASS, RESTART });
+  }, { TURN, USER, PASS, RESTART, PEER2_DIRECT });
 
   console.log(JSON.stringify(result, null, 2));
   await browser.close();

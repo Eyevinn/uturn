@@ -1261,8 +1261,8 @@ impl TurnHandler {
         };
 
         // Check permission (snapshot, then release the guard before the await).
-        let permitted = match self.allocations.get_by_client(src_addr) {
-            Some(a) => a.is_permitted(peer_addr.ip()),
+        let (sender_id, permitted) = match self.allocations.get_by_client(src_addr) {
+            Some(a) => (a.id, a.is_permitted(peer_addr.ip())),
             None => return Ok(()),
         };
         if !permitted {
@@ -1310,6 +1310,12 @@ impl TurnHandler {
                     data.len(),
                     src_addr,
                     peer_addr
+                );
+                crate::relay::track_client_stun_to_peer(
+                    &self.allocations,
+                    sender_id,
+                    data,
+                    peer_addr,
                 );
                 socket.send_to(data, peer_addr).await?;
             }
