@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -24,6 +24,18 @@ pub const CHANNEL_LIFETIME_MS: u64 = 600_000;
 /// CreatePermission (or ChannelBind, which also installs a permission) for the
 /// same peer IP.
 pub const PERMISSION_LIFETIME_MS: u64 = 300_000;
+
+/// How long a STUN request a client sent to an external peer waits for the
+/// peer's response. A retransmit of the request (same transaction id)
+/// restarts it. Responses arrive within a round trip; this only has to
+/// outlast one retransmit interval.
+pub const PEER_TXN_LIFETIME_MS: u64 = 10_000;
+
+/// Outstanding STUN requests to external peers per allocation. ICE paces
+/// new checks at ~20/s and unanswered ones linger for the lifetime above
+/// (reaped every cleanup tick), so this leaves headroom; it exists to stop
+/// one client growing the table.
+pub const MAX_PEER_TXNS_PER_ALLOC: usize = 256;
 
 /// Unique allocation identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -98,6 +110,26 @@ pub struct Allocation {
 
     /// Remote ICE ufrag this allocation communicates with (from STUN USERNAME)
     pub ice_remote_ufrag: RwLock<Option<Arc<str>>>,
+
+    /// Entries this allocation holds in `AllocationTable::peer_txns`, for
+    /// the per-allocation cap.
+    pending_peer_txns: AtomicUsize,
+
+    /// (local, remote) ICE ufrags from this client's checks to external
+    /// peers. Kept apart from `ice_ufrag`/`ice_remote_ufrag`, which route
+    /// client-to-client traffic first-come-first-served.
+    peer_ice_ufrags: RwLock<Option<(Arc<str>, Arc<str>)>>,
+}
+
+/// A STUN request a client sent to an external peer, awaiting its response.
+#[derive(Debug)]
+struct PendingPeerTxn {
+    /// The sending allocation.
+    id: AllocationId,
+    /// Where the request went; only a response from this address matches.
+    peer_addr: SocketAddr,
+    /// Coarse-clock deadline after which the entry is dropped.
+    expires_ms: u64,
 }
 
 /// A channel binding: the bound peer plus the deadline at which it lapses.
@@ -159,6 +191,8 @@ impl Allocation {
             allocate_txn_id,
             ice_ufrag: RwLock::new(None),
             ice_remote_ufrag: RwLock::new(None),
+            pending_peer_txns: AtomicUsize::new(0),
+            peer_ice_ufrags: RwLock::new(None),
         }
     }
 
@@ -441,6 +475,16 @@ pub struct AllocationTable {
 
     /// Lookup by ICE ufrag (learned from STUN USERNAME attribute)
     by_ice_ufrag: DashMap<String, AllocationId>,
+
+    /// STUN requests clients sent to external peers, by transaction id, so
+    /// the peer's response (which carries no USERNAME) can be routed back.
+    peer_txns: DashMap<[u8; 12], PendingPeerTxn>,
+
+    /// Local ICE ufrag from clients' checks to external peers -> allocations.
+    /// Several may claim one ufrag; a peer's check goes to every claimant
+    /// that also matches, so claiming a ufrag first cannot cut the real
+    /// client off.
+    by_peer_ice_ufrag: DashMap<Arc<str>, Vec<AllocationId>>,
 }
 
 impl AllocationTable {
@@ -452,6 +496,8 @@ impl AllocationTable {
             by_permission: DashMap::new(),
             by_peer_tuple: DashMap::new(),
             by_ice_ufrag: DashMap::new(),
+            peer_txns: DashMap::new(),
+            by_peer_ice_ufrag: DashMap::new(),
         }
     }
 
@@ -796,6 +842,7 @@ impl AllocationTable {
             if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
                 self.by_ice_ufrag.remove(ice_ufrag.as_ref());
             }
+            self.unindex_peer_ice(id, &alloc);
 
             for &peer_ip in alloc.permissions.read().keys() {
                 self.remove_from_permission_index(peer_ip, id);
@@ -819,6 +866,162 @@ impl AllocationTable {
         for entry in self.allocations.iter() {
             entry.value().cleanup_expired_channels();
         }
+    }
+
+    /// Remember STUN request `txn` that allocation `id` sent to external
+    /// `peer_addr`, or refresh it on retransmit. Returns false when the
+    /// allocation is at its cap or another allocation already holds `txn`.
+    pub fn record_peer_txn(&self, id: AllocationId, txn: [u8; 12], peer_addr: SocketAddr) -> bool {
+        use dashmap::mapref::entry::Entry;
+
+        // Lock order: `allocations` before the index.
+        let Some(alloc) = self.allocations.get(&id) else {
+            return false;
+        };
+        let expires_ms = coarse_now_ms() + PEER_TXN_LIFETIME_MS;
+        match self.peer_txns.entry(txn) {
+            Entry::Occupied(mut e) => {
+                if e.get().id != id {
+                    return false;
+                }
+                e.insert(PendingPeerTxn {
+                    id,
+                    peer_addr,
+                    expires_ms,
+                });
+                true
+            }
+            Entry::Vacant(e) => {
+                if alloc.pending_peer_txns.load(Ordering::Relaxed) >= MAX_PEER_TXNS_PER_ALLOC {
+                    return false;
+                }
+                alloc.pending_peer_txns.fetch_add(1, Ordering::Relaxed);
+                e.insert(PendingPeerTxn {
+                    id,
+                    peer_addr,
+                    expires_ms,
+                });
+                true
+            }
+        }
+    }
+
+    /// The allocation whose client sent STUN request `txn` to `peer_addr`,
+    /// consuming the pending entry. The allocation must still be permitted
+    /// for the peer's IP (RFC 5766 §10.3).
+    pub fn take_peer_txn_owner(
+        &self,
+        peer_addr: SocketAddr,
+        txn: &[u8; 12],
+    ) -> Option<AllocationId> {
+        let now = coarse_now_ms();
+        // Index guard released at the end of this statement.
+        let (_, pending) = self
+            .peer_txns
+            .remove_if(txn, |_, p| p.peer_addr == peer_addr && now < p.expires_ms)?;
+        let alloc = self.allocations.get(&pending.id)?;
+        Self::release_peer_txn_slot(&alloc);
+        alloc.is_permitted(peer_addr.ip()).then_some(pending.id)
+    }
+
+    fn release_peer_txn_slot(alloc: &Allocation) {
+        let _ = alloc
+            .pending_peer_txns
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
+
+    /// Drop STUN requests to external peers that were never answered.
+    pub fn cleanup_peer_txns(&self) {
+        let now = coarse_now_ms();
+        let mut owners = Vec::new();
+        self.peer_txns.retain(|_, p| {
+            let live = now < p.expires_ms;
+            if !live {
+                owners.push(p.id);
+            }
+            live
+        });
+        // Index guards are released; now touch the allocations.
+        for id in owners {
+            if let Some(alloc) = self.allocations.get(&id) {
+                Self::release_peer_txn_slot(&alloc);
+            }
+        }
+    }
+
+    /// Record the (local, remote) ICE ufrags of a check allocation `id` sent
+    /// to an external peer, so the peer's own checks can find it.
+    pub fn register_peer_ice_ufrags(&self, id: AllocationId, local: &str, remote: &str) {
+        // Lock order: `allocations` before the index.
+        let Some(alloc) = self.allocations.get(&id) else {
+            return;
+        };
+        let mut current = alloc.peer_ice_ufrags.write();
+        if let Some((l, r)) = current.as_ref() {
+            if l.as_ref() == local && r.as_ref() == remote {
+                return;
+            }
+        }
+        let old_local = current.as_ref().map(|(l, _)| l.clone());
+        let local: Arc<str> = local.into();
+        *current = Some((local.clone(), remote.into()));
+        drop(current);
+
+        if old_local.as_deref() == Some(local.as_ref()) {
+            return;
+        }
+        if let Some(old) = old_local {
+            self.unindex_peer_ice_ufrag(&old, id);
+        }
+        let mut ids = self.by_peer_ice_ufrag.entry(local).or_default();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+
+    fn unindex_peer_ice_ufrag(&self, local: &Arc<str>, id: AllocationId) {
+        let empty = match self.by_peer_ice_ufrag.get_mut(local) {
+            Some(mut ids) => {
+                ids.retain(|&i| i != id);
+                ids.is_empty()
+            }
+            None => false,
+        };
+        if empty {
+            self.by_peer_ice_ufrag.remove_if(local, |_, v| v.is_empty());
+        }
+    }
+
+    /// Drop `alloc` from the external-peer ufrag index (allocation removal).
+    fn unindex_peer_ice(&self, id: AllocationId, alloc: &Allocation) {
+        if let Some((local, _)) = alloc.peer_ice_ufrags.read().as_ref() {
+            self.unindex_peer_ice_ufrag(local, id);
+        }
+    }
+
+    /// Allocations a peer's ICE check (USERNAME "client_ufrag:peer_ufrag")
+    /// is for: those that sent checks as `client_ufrag` to `peer_ufrag` and
+    /// are permitted for the peer's IP.
+    pub fn peer_ice_targets(
+        &self,
+        peer_addr: SocketAddr,
+        client_ufrag: &str,
+        peer_ufrag: &str,
+    ) -> Vec<AllocationId> {
+        let Some(ids) = self.by_peer_ice_ufrag.get(client_ufrag).map(|r| r.clone()) else {
+            return Vec::new();
+        };
+        ids.into_iter()
+            .filter(|&id| {
+                self.allocations.get(&id).is_some_and(|a| {
+                    a.is_permitted(peer_addr.ip())
+                        && a.peer_ice_ufrags
+                            .read()
+                            .as_ref()
+                            .is_some_and(|(_, r)| r.as_ref() == peer_ufrag)
+                })
+            })
+            .collect()
     }
 
     /// Drop lapsed permissions (RFC 5766 §9) and prune empty `by_permission` entries.
@@ -849,6 +1052,7 @@ impl AllocationTable {
                 if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
                     self.by_ice_ufrag.remove(ice_ufrag.as_ref());
                 }
+                self.unindex_peer_ice(*id, alloc);
                 for &peer_ip in alloc.permissions.read().keys() {
                     self.remove_from_permission_index(peer_ip, *id);
                 }
@@ -882,6 +1086,7 @@ impl AllocationTable {
                 if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
                     self.by_ice_ufrag.remove(ice_ufrag.as_ref());
                 }
+                self.unindex_peer_ice(*id, alloc);
                 for &peer_ip in alloc.permissions.read().keys() {
                     self.remove_from_permission_index(peer_ip, *id);
                 }
@@ -915,6 +1120,7 @@ impl AllocationTable {
                 if let Some(ice_ufrag) = alloc.get_ice_ufrag() {
                     self.by_ice_ufrag.remove(ice_ufrag.as_ref());
                 }
+                self.unindex_peer_ice(*id, alloc);
                 for &peer_ip in alloc.permissions.read().keys() {
                     self.remove_from_permission_index(peer_ip, *id);
                 }
@@ -940,6 +1146,129 @@ impl Default for AllocationTable {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    // ---- STUN requests to external peers ----------------------------------
+
+    fn peer_table() -> (AllocationTable, AllocationId, AllocationId) {
+        let t = AllocationTable::new();
+        let a = t.create("192.0.2.1:5000".parse().unwrap(), "a".into(), 600);
+        let b = t.create("192.0.2.2:5000".parse().unwrap(), "b".into(), 600);
+        for id in [a, b] {
+            t.add_permission(id, "198.51.100.7".parse().unwrap());
+        }
+        (t, a, b)
+    }
+
+    const PEER: &str = "198.51.100.7:5000";
+
+    fn txn(i: usize) -> [u8; 12] {
+        let mut t = [0u8; 12];
+        t[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        t
+    }
+
+    #[test]
+    fn peer_txn_goes_to_its_sender_only_once_and_only_from_its_peer() {
+        let (t, a, b) = peer_table();
+        let peer: SocketAddr = PEER.parse().unwrap();
+        assert!(t.record_peer_txn(a, txn(1), peer));
+        assert!(!t.record_peer_txn(b, txn(1), peer), "first sender keeps it");
+
+        assert_eq!(
+            t.take_peer_txn_owner("198.51.100.7:5001".parse().unwrap(), &txn(1)),
+            None
+        );
+        assert_eq!(t.take_peer_txn_owner(peer, &txn(2)), None);
+        assert_eq!(t.take_peer_txn_owner(peer, &txn(1)), Some(a));
+        assert_eq!(t.take_peer_txn_owner(peer, &txn(1)), None, "consumed");
+    }
+
+    #[test]
+    fn peer_txn_needs_a_live_permission() {
+        let (t, a, _) = peer_table();
+        let peer: SocketAddr = PEER.parse().unwrap();
+        t.record_peer_txn(a, txn(1), peer);
+        t.get(a).unwrap().permissions.write().clear();
+        assert_eq!(t.take_peer_txn_owner(peer, &txn(1)), None);
+    }
+
+    #[test]
+    fn lapsed_peer_txn_is_reaped_and_frees_its_slot() {
+        let (t, a, _) = peer_table();
+        let peer: SocketAddr = PEER.parse().unwrap();
+        t.record_peer_txn(a, txn(1), peer);
+        t.peer_txns.get_mut(&txn(1)).unwrap().expires_ms = 0;
+
+        assert_eq!(t.take_peer_txn_owner(peer, &txn(1)), None);
+        t.cleanup_peer_txns();
+        assert!(t.peer_txns.is_empty());
+        assert_eq!(
+            t.get(a).unwrap().pending_peer_txns.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn peer_txn_cap_refuses_new_but_refreshes_retransmits() {
+        let (t, a, b) = peer_table();
+        let peer: SocketAddr = PEER.parse().unwrap();
+        for i in 0..MAX_PEER_TXNS_PER_ALLOC {
+            assert!(t.record_peer_txn(a, txn(i), peer));
+        }
+        assert!(!t.record_peer_txn(a, txn(usize::MAX), peer), "cap");
+        assert!(t.record_peer_txn(a, txn(0), peer), "retransmit refreshes");
+        assert!(
+            t.record_peer_txn(b, txn(usize::MAX), peer),
+            "cap is per allocation"
+        );
+
+        assert_eq!(t.take_peer_txn_owner(peer, &txn(0)), Some(a));
+        assert!(
+            t.record_peer_txn(a, txn(usize::MAX - 1), peer),
+            "slot freed"
+        );
+    }
+
+    #[test]
+    fn peer_ice_check_reaches_every_matching_claimant() {
+        // An allocation that claims a victim's ufrag first must not cut the
+        // victim off: both get the check (and the claimant learns nothing it
+        // did not already put in its own USERNAME).
+        let (t, a, b) = peer_table();
+        let peer: SocketAddr = PEER.parse().unwrap();
+        t.register_peer_ice_ufrags(b, "cli", "peer");
+        t.register_peer_ice_ufrags(a, "cli", "peer");
+        let mut got = t.peer_ice_targets(peer, "cli", "peer");
+        got.sort_by_key(|id| id.0);
+        assert_eq!(got, vec![a, b]);
+
+        assert!(t.peer_ice_targets(peer, "cli", "other").is_empty());
+        assert!(t
+            .peer_ice_targets("198.51.100.99:5000".parse().unwrap(), "cli", "peer")
+            .is_empty());
+    }
+
+    #[test]
+    fn peer_ice_ufrags_follow_restart_and_removal() {
+        let (t, a, _) = peer_table();
+        let peer: SocketAddr = PEER.parse().unwrap();
+        t.register_peer_ice_ufrags(a, "old", "peer");
+        t.register_peer_ice_ufrags(a, "new", "peer2");
+        assert!(t.peer_ice_targets(peer, "old", "peer").is_empty());
+        assert_eq!(t.peer_ice_targets(peer, "new", "peer2"), vec![a]);
+
+        t.remove(a);
+        assert!(t.peer_ice_targets(peer, "new", "peer2").is_empty());
+        assert!(t.by_peer_ice_ufrag.is_empty());
+    }
+
+    #[test]
+    fn peer_ice_ufrags_leave_the_client_to_client_index_alone() {
+        let (t, a, _) = peer_table();
+        t.register_peer_ice_ufrags(a, "cli", "peer");
+        assert_eq!(t.lookup_by_ice_ufrag("cli"), None);
+        assert!(t.get(a).unwrap().get_ice_ufrag().is_none());
+    }
 
     // ---- channel binding lifetime (RFC 5766 §11) ----------------------------
 

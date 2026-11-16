@@ -162,6 +162,9 @@ impl Server {
                 // Reap permissions past their 5-minute lifetime (RFC 5766 §9).
                 cleanup_allocations.cleanup_permissions();
 
+                // Drop STUN requests to external peers that were never answered.
+                cleanup_allocations.cleanup_peer_txns();
+
                 // Cleanup stale rate limiter entries
                 cleanup_rate_limiter.cleanup();
             }
@@ -206,19 +209,34 @@ impl Server {
 
         match packet_type {
             PacketType::Stun(msg) => {
-                // STUN messages are ALWAYS processed by the TURN handler.
-                // This includes new Allocate requests from any source.
+                // STUN from an external peer (an ICE check or a response to a
+                // client's check) is relayed to the client it is for.
+                if !is_client && self.relay_engine.relay_peer_stun(&msg, src_addr).await? {
+                    return Ok(());
+                }
+                // Everything else goes to the TURN handler, including new
+                // Allocate requests from any source.
                 debug!("STUN message from {}", src_addr);
                 self.turn_handler
                     .handle_stun(msg, src_addr, &self.socket)
                     .await?;
             }
 
-            PacketType::TurnChannelData { channel, data } => {
+            PacketType::TurnChannelData {
+                channel,
+                data: payload,
+            } if is_client => {
                 debug!("ChannelData (channel={}) from {}", channel, src_addr);
                 self.relay_engine
-                    .handle_channel_data(channel, &data, src_addr)
+                    .handle_channel_data(channel, &payload, src_addr)
                     .await?;
+            }
+
+            // Only clients send ChannelData. From anyone else, a first byte
+            // in 0x40-0x7F is just the start of the peer's payload: relay it
+            // whole like any other peer data.
+            PacketType::TurnChannelData { .. } => {
+                self.relay_engine.handle_peer_data(data, src_addr).await?;
             }
 
             PacketType::Rtp { ssrc, data } => {
@@ -480,5 +498,354 @@ impl Server {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Relaying STUN between a TURN client and an external peer, i.e. a peer
+    //! that is not itself a client of this server (an SFU, or a browser
+    //! without TURN). ICE needs both directions: the peer's Binding requests
+    //! must reach the client, and the peer's responses to the client's
+    //! requests must come back.
+
+    use super::*;
+    use crate::demux::{StunClass, StunInfo, StunMethod};
+    use std::net::IpAddr;
+
+    const PEER: &str = "198.51.100.7:5000";
+    const CLIENT_UFRAG: &str = "cliU";
+    const PEER_UFRAG: &str = "peerU";
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// A STUN message: header, then attributes, each padded to 4 bytes.
+    fn stun(msg_type: u16, txn: [u8; 12], attrs: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (t, v) in attrs {
+            body.extend_from_slice(&t.to_be_bytes());
+            body.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            body.extend_from_slice(v);
+            body.resize(body.len() + (4 - v.len() % 4) % 4, 0);
+        }
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&msg_type.to_be_bytes());
+        msg.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+        msg.extend_from_slice(&txn);
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    fn binding_request(txn: [u8; 12], username: &str) -> Vec<u8> {
+        stun(0x0001, txn, &[(0x0006, username.as_bytes().to_vec())])
+    }
+
+    fn binding_success(txn: [u8; 12]) -> Vec<u8> {
+        stun(0x0101, txn, &[])
+    }
+
+    fn xor_v4(addr: SocketAddr) -> Vec<u8> {
+        let SocketAddr::V4(v4) = addr else {
+            panic!("IPv4 only")
+        };
+        let mut v = vec![0x00, 0x01];
+        v.extend_from_slice(&(v4.port() ^ 0x2112).to_be_bytes());
+        let magic = [0x21, 0x12, 0xa4, 0x42];
+        v.extend(v4.ip().octets().iter().zip(magic).map(|(a, m)| a ^ m));
+        v
+    }
+
+    /// Send indication carrying `data` to `peer`.
+    fn send_indication(peer: SocketAddr, data: &[u8]) -> Vec<u8> {
+        stun(
+            0x0016,
+            rand::random(),
+            &[(0x0012, xor_v4(peer)), (0x0013, data.to_vec())],
+        )
+    }
+
+    /// A server with one allocation for a real client socket, permitted to
+    /// talk to `PEER`. Allocation and permission are installed directly; the
+    /// auth path is covered elsewhere.
+    async fn setup() -> (Server, tokio::net::UdpSocket, SocketAddr) {
+        let config = Config::new(IpAddr::from([127, 0, 0, 1]))
+            .with_port(0)
+            .with_credential("u", "p");
+        let server = Server::new(config).await.unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let id = server.allocations.create(client_addr, "u".into(), 600);
+        server.allocations.add_permission(id, sa(PEER).ip());
+        (server, client, client_addr)
+    }
+
+    /// The next datagram the client receives, or None within 200 ms.
+    async fn recv(client: &tokio::net::UdpSocket) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; 2048];
+        match tokio::time::timeout(Duration::from_millis(200), client.recv(&mut buf)).await {
+            Ok(Ok(n)) => Some(buf[..n].to_vec()),
+            _ => None,
+        }
+    }
+
+    /// Assert `packet` is a Data indication from `peer` carrying `data`.
+    fn assert_data_indication(packet: &[u8], peer: SocketAddr, data: &[u8]) {
+        let msg = StunInfo::parse(packet).expect("STUN");
+        assert_eq!(msg.class, StunClass::Indication);
+        assert_eq!(msg.method, StunMethod::Data);
+        assert_eq!(msg.xor_peer_addresses, vec![peer]);
+        assert_eq!(msg.data.as_deref(), Some(data));
+    }
+
+    /// The client sends its ICE check to the peer, so uTURN learns the
+    /// client's ufrag and the check's transaction id.
+    async fn client_checks_peer(server: &Server, client_addr: SocketAddr, txn: [u8; 12]) {
+        let check = binding_request(txn, &format!("{PEER_UFRAG}:{CLIENT_UFRAG}"));
+        server
+            .handle_packet(&send_indication(sa(PEER), &check), client_addr)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_response_to_client_check_reaches_the_client() {
+        let (server, client, client_addr) = setup().await;
+        let txn: [u8; 12] = rand::random();
+        client_checks_peer(&server, client_addr, txn).await;
+
+        let response = binding_success(txn);
+        server.handle_packet(&response, sa(PEER)).await.unwrap();
+
+        let got = recv(&client).await.expect("response relayed to client");
+        assert_data_indication(&got, sa(PEER), &response);
+    }
+
+    #[tokio::test]
+    async fn peer_check_addressed_to_client_reaches_the_client() {
+        let (server, client, client_addr) = setup().await;
+        client_checks_peer(&server, client_addr, rand::random()).await;
+
+        let check = binding_request(rand::random(), &format!("{CLIENT_UFRAG}:{PEER_UFRAG}"));
+        server.handle_packet(&check, sa(PEER)).await.unwrap();
+
+        let got = recv(&client).await.expect("check relayed to client");
+        assert_data_indication(&got, sa(PEER), &check);
+    }
+
+    #[tokio::test]
+    async fn checks_over_a_bound_channel_round_trip_as_channel_data() {
+        let (server, client, client_addr) = setup().await;
+        const CHANNEL: u16 = 0x4000;
+        server
+            .allocations
+            .get_by_client(client_addr)
+            .unwrap()
+            .bind_channel(CHANNEL, sa(PEER));
+
+        let txn: [u8; 12] = rand::random();
+        let check = binding_request(txn, &format!("{PEER_UFRAG}:{CLIENT_UFRAG}"));
+        let mut framed = CHANNEL.to_be_bytes().to_vec();
+        framed.extend_from_slice(&(check.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&check);
+        server.handle_packet(&framed, client_addr).await.unwrap();
+
+        let response = binding_success(txn);
+        server.handle_packet(&response, sa(PEER)).await.unwrap();
+
+        let got = recv(&client).await.expect("response relayed to client");
+        assert_eq!(&got[..2], &CHANNEL.to_be_bytes());
+        assert_eq!(&got[4..4 + response.len()], &response[..]);
+    }
+
+    /// A second client on the same server, also permitted for `PEER`.
+    async fn second_client(server: &Server) -> (tokio::net::UdpSocket, SocketAddr) {
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = client.local_addr().unwrap();
+        let id = server.allocations.create(addr, "u".into(), 600);
+        server.allocations.add_permission(id, sa(PEER).ip());
+        (client, addr)
+    }
+
+    #[tokio::test]
+    async fn peer_response_reaches_only_the_client_that_asked() {
+        // Two clients talk to the same peer (e.g. one SFU); a response must
+        // not cross over to the other one.
+        let (server, client, client_addr) = setup().await;
+        let (other, _) = second_client(&server).await;
+        let txn: [u8; 12] = rand::random();
+        client_checks_peer(&server, client_addr, txn).await;
+
+        server
+            .handle_packet(&binding_success(txn), sa(PEER))
+            .await
+            .unwrap();
+        assert!(recv(&client).await.is_some());
+        assert!(recv(&other).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_check_reaches_only_its_ice_session() {
+        let (server, client, client_addr) = setup().await;
+        let (other, other_addr) = second_client(&server).await;
+        client_checks_peer(&server, client_addr, rand::random()).await;
+        let other_check = binding_request(rand::random(), "peerU:otherU");
+        server
+            .handle_packet(&send_indication(sa(PEER), &other_check), other_addr)
+            .await
+            .unwrap();
+
+        let check = binding_request(rand::random(), &format!("{CLIENT_UFRAG}:{PEER_UFRAG}"));
+        server.handle_packet(&check, sa(PEER)).await.unwrap();
+        assert!(recv(&client).await.is_some());
+        assert!(recv(&other).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_check_before_the_clients_own_check_is_not_relayed() {
+        // Nothing yet ties the ufrag to an allocation; the peer retransmits.
+        let (server, client, _) = setup().await;
+        let check = binding_request(rand::random(), &format!("{CLIENT_UFRAG}:{PEER_UFRAG}"));
+        server.handle_packet(&check, sa(PEER)).await.unwrap();
+        assert!(recv(&client).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_check_uses_the_bound_channel() {
+        let (server, client, client_addr) = setup().await;
+        const CHANNEL: u16 = 0x4001;
+        server
+            .allocations
+            .get_by_client(client_addr)
+            .unwrap()
+            .bind_channel(CHANNEL, sa(PEER));
+        client_checks_peer(&server, client_addr, rand::random()).await;
+
+        let check = binding_request(rand::random(), &format!("{CLIENT_UFRAG}:{PEER_UFRAG}"));
+        server.handle_packet(&check, sa(PEER)).await.unwrap();
+
+        let got = recv(&client).await.expect("check relayed to client");
+        assert_eq!(&got[..2], &CHANNEL.to_be_bytes());
+        assert_eq!(&got[4..4 + check.len()], &check[..]);
+    }
+
+    #[tokio::test]
+    async fn peer_response_with_unknown_transaction_is_not_relayed() {
+        let (server, client, client_addr) = setup().await;
+        client_checks_peer(&server, client_addr, rand::random()).await;
+
+        server
+            .handle_packet(&binding_success(rand::random()), sa(PEER))
+            .await
+            .unwrap();
+        assert!(recv(&client).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn response_from_another_address_is_not_relayed() {
+        let (server, client, client_addr) = setup().await;
+        let txn: [u8; 12] = rand::random();
+        client_checks_peer(&server, client_addr, txn).await;
+
+        // Same IP, other port: the client asked 198.51.100.7:5000, not :5001.
+        server
+            .handle_packet(&binding_success(txn), sa("198.51.100.7:5001"))
+            .await
+            .unwrap();
+        assert!(recv(&client).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_from_unpermitted_peer_is_not_relayed() {
+        let (server, client, client_addr) = setup().await;
+        client_checks_peer(&server, client_addr, rand::random()).await;
+
+        let check = binding_request(rand::random(), &format!("{CLIENT_UFRAG}:{PEER_UFRAG}"));
+        server
+            .handle_packet(&check, sa("198.51.100.99:5000"))
+            .await
+            .unwrap();
+        assert!(recv(&client).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_naming_another_remote_ufrag_is_not_relayed() {
+        let (server, client, client_addr) = setup().await;
+        client_checks_peer(&server, client_addr, rand::random()).await;
+
+        let check = binding_request(rand::random(), &format!("{CLIENT_UFRAG}:other"));
+        server.handle_packet(&check, sa(PEER)).await.unwrap();
+        assert!(recv(&client).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn plain_binding_request_from_peer_is_still_answered_not_relayed() {
+        // A Binding request without USERNAME is STUN, not ICE: srflx discovery
+        // against this server. It keeps getting a Binding response.
+        let (server, client, client_addr) = setup().await;
+        client_checks_peer(&server, client_addr, rand::random()).await;
+
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let probe_addr = probe.local_addr().unwrap();
+        let id = server.allocations.get_by_client(client_addr).unwrap().id;
+        server.allocations.add_permission(id, probe_addr.ip());
+
+        let txn: [u8; 12] = rand::random();
+        server
+            .handle_packet(&stun(0x0001, txn, &[]), probe_addr)
+            .await
+            .unwrap();
+
+        assert!(recv(&client).await.is_none());
+        let answer = StunInfo::parse(&recv(&probe).await.expect("answered")).unwrap();
+        assert_eq!(answer.class, StunClass::SuccessResponse);
+        assert_eq!(answer.transaction_id, txn);
+    }
+}
+
+#[cfg(test)]
+mod peer_data_tests {
+    use super::*;
+    use crate::demux::StunInfo;
+    use std::net::IpAddr;
+
+    #[tokio::test]
+    async fn peer_data_starting_like_channel_data_reaches_the_client() {
+        let config = Config::new(IpAddr::from([127, 0, 0, 1]))
+            .with_port(0)
+            .with_credential("u", "p");
+        let server = Server::new(config).await.unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let peer: SocketAddr = "198.51.100.7:5000".parse().unwrap();
+        let id = server.allocations.create(client_addr, "u".into(), 600);
+        server.allocations.add_permission(id, peer.ip());
+
+        // turnutils_uclient payload: little-endian msgnum first, so message
+        // 64 starts 0x40 0x00 0x00 0x00 - a valid empty ChannelData header.
+        let mut payload = vec![0x40, 0, 0, 0, 0, 0, 0, 0];
+        payload.resize(100, 7);
+        server.handle_packet(&payload, peer).await.unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_millis(200), client.recv(&mut buf))
+            .await
+            .expect("peer data relayed to client")
+            .unwrap();
+        let msg = StunInfo::parse(&buf[..n]).unwrap();
+        assert_eq!(msg.data.as_deref(), Some(&payload[..]));
+
+        // From an address with no permission it is dropped, as before.
+        server
+            .handle_packet(&payload, "198.51.100.99:5000".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), client.recv(&mut buf))
+                .await
+                .is_err()
+        );
     }
 }

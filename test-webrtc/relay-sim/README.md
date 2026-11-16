@@ -27,7 +27,15 @@ cargo run -- --external-ip 192.0.2.2 --port 3478 --user test:testpass
 # CHROMIUM_PATH is optional; omit it to use Playwright's bundled Chromium.
 TURN_URL='turn:192.0.2.2:3478?transport=udp' node relaytest.js
 ICE_RESTART=1 node relaytest.js        # also exercises an ICE restart mid-call
+PEER2_DIRECT=1 node relaytest.js       # only one peer uses TURN (external-peer path)
 ```
+
+`PEER2_DIRECT=1` gives the second peer no TURN server, so it is an external
+peer of the relay rather than a client. That exercises the client-to-peer
+path, including the peer's own ICE checks and responses arriving as STUN.
+It needs the relay address on a different local interface than the one the
+direct peer uses (the server refuses its own external IP as a peer), e.g.
+two interfaces, or an alias such as `192.0.2.2` on loopback.
 
 To exercise time-limited TURN REST API credentials instead of `test:testpass`,
 start the server with `--static-auth-secret example-secret-0123456789` and run with

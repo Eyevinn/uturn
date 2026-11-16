@@ -10,6 +10,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, trace};
 
 use crate::config::Config;
+use crate::demux::{StunClass, StunInfo, StunMethod};
 use crate::lookup::{AllocationId, AllocationTable};
 use crate::turn::handler::is_forbidden_peer_addr;
 
@@ -122,6 +123,47 @@ struct Delivery {
     /// Channel bound (from the receiver's perspective) to the packet's source,
     /// if any. `Some` selects ChannelData framing, `None` a Data Indication.
     channel: Option<u16>,
+}
+
+/// Note a STUN request a client is sending to an external peer, so the
+/// peer's STUN can be routed back to that client.
+///
+/// Every allocation shares the relay transport address, so STUN from a peer
+/// carries nothing that says which client it is for except what the client
+/// put in its own requests:
+/// - the transaction id, which the peer's response echoes, and
+/// - for an ICE check, the client's ufrag in USERNAME ("remote:local"),
+///   which the peer's own checks name as their recipient.
+///
+/// The ufrags go into an index of their own, not the first-come
+/// client-to-client one (`register_ice_ufrags`).
+pub(crate) fn track_client_stun_to_peer(
+    allocations: &AllocationTable,
+    id: AllocationId,
+    data: &[u8],
+    peer_addr: SocketAddr,
+) {
+    if !is_stun(data) {
+        return;
+    }
+    let Some(msg) = StunInfo::parse(data) else {
+        return;
+    };
+    if msg.class != StunClass::Request {
+        return;
+    }
+    if msg.method == StunMethod::Binding {
+        if let Some((remote_ufrag, local_ufrag)) = msg.parse_ice_username() {
+            allocations.register_peer_ice_ufrags(id, &local_ufrag, &remote_ufrag);
+        }
+    }
+    if !allocations.record_peer_txn(id, msg.transaction_id, peer_addr) {
+        trace!(
+            "STUN request from {} to {} not tracked (limit reached or id in use)",
+            id,
+            peer_addr
+        );
+    }
 }
 
 impl RelayEngine {
@@ -290,6 +332,63 @@ impl RelayEngine {
         }
 
         Ok(())
+    }
+
+    /// Relay STUN from an external peer (not a client of this server) to the
+    /// client it is for. Returns false when the message is not for any
+    /// client, leaving it to the TURN handler as before.
+    ///
+    /// - A Binding request with USERNAME is an ICE check. Its first ufrag
+    ///   names the recipient: a client that sent checks under that ufrag to
+    ///   the ufrag this check comes from, and holds a permission for the
+    ///   peer's IP. A Binding request without USERNAME is ordinary STUN
+    ///   aimed at this server and is not touched.
+    /// - A response goes to the client whose request to this exact peer
+    ///   address it answers (see [`track_client_stun_to_peer`]).
+    ///
+    /// Never fans out beyond those: a check's USERNAME must not reach
+    /// clients outside that ICE session.
+    pub async fn relay_peer_stun(&self, msg: &StunInfo, peer_addr: SocketAddr) -> Result<bool> {
+        let targets = match (msg.class, msg.method) {
+            (StunClass::Request, StunMethod::Binding) => {
+                let Some((client_ufrag, peer_ufrag)) = msg.parse_ice_username() else {
+                    return Ok(false);
+                };
+                self.allocations
+                    .peer_ice_targets(peer_addr, &client_ufrag, &peer_ufrag)
+            }
+            (StunClass::SuccessResponse | StunClass::ErrorResponse, _) => self
+                .allocations
+                .take_peer_txn_owner(peer_addr, &msg.transaction_id)
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        // Snapshot the receivers, release the guards, then send.
+        let deliveries: Vec<Delivery> = targets
+            .into_iter()
+            .filter_map(|id| {
+                let a = self.allocations.get(id)?;
+                Some(Delivery {
+                    id,
+                    client_addr: a.client_addr,
+                    channel: a.channel_for_peer(peer_addr),
+                })
+            })
+            .collect();
+        if deliveries.is_empty() {
+            return Ok(false);
+        }
+        for d in deliveries {
+            debug!(
+                "Relaying STUN {:?} {:?} from peer {} to client {}",
+                msg.class, msg.method, peer_addr, d.client_addr
+            );
+            self.deliver(&d, peer_addr, &msg.raw).await?;
+            self.touch(d.id);
+        }
+        Ok(true)
     }
 
     /// Handle TURN ChannelData from client
@@ -523,6 +622,7 @@ impl RelayEngine {
                     peer_addr,
                     channel
                 );
+                track_client_stun_to_peer(&self.allocations, alloc_id, data, peer_addr);
                 self.socket.send_to(data, peer_addr).await?;
             }
         }
