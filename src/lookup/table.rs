@@ -925,9 +925,11 @@ impl AllocationTable {
     }
 
     fn release_peer_txn_slot(alloc: &Allocation) {
-        let _ = alloc
-            .pending_peer_txns
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        // Packets are handled on one task, so check-then-sub cannot race
+        // another release for the same allocation.
+        if alloc.pending_peer_txns.load(Ordering::Relaxed) > 0 {
+            alloc.pending_peer_txns.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Drop STUN requests to external peers that were never answered.
